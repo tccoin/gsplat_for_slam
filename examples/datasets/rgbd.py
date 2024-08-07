@@ -64,12 +64,13 @@ class Parser:
         fx, fy, cx, cy = cam_data['fx'], cam_data['fy'], cam_data['cx'], cam_data['cy']
         image_width, image_height = cam_data['image_width'], cam_data['image_height']
         intrinsic = o3d.camera.PinholeCameraIntrinsic(image_width, image_height, fx, fy, cx, cy)
-        conv_mat = np.array([
-            [1, 0, 0, 0],
-            [0, -1, 0, 0],
-            [0, 0, -1, 0],
-            [0, 0, 0, 1],
+        conv_T = np.array([
+            [0,0,1,0],
+            [0,1,0,0],
+            [-1,0,0,0],
+            [0,0,0,1]
         ])
+        conv_T_inv = np.linalg.inv(conv_T)
 
         # Extract extrinsic matrices in world-to-camera format.
         w2c_mats = []
@@ -82,12 +83,12 @@ class Parser:
         depth_paths = []
         stacked_pc = o3d.geometry.PointCloud()
         
-        # for i in range(N):
-        for i in range(0,20):
+        for i in range(0,N,2):
+        # for i in range(0,10,1):
             T = np.eye(4)
             T[:3, :3] = q2r(traj_raw[i][4:8], order='xyzs')
             T[:3, 3] = traj_raw[i][1:4]
-            w2c_mats.append(T)
+            w2c_mats.append(np.linalg.inv(conv_T@T@conv_T_inv))
             camera_id = i
             camera_ids.append(camera_id)
             K = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]])
@@ -113,6 +114,7 @@ class Parser:
             pcd = pcd.voxel_down_sample(voxel_size=0.01)
             pcd.transform(T)
             stacked_pc += pcd
+            print(f"point cloud {i} has {len(pcd.points)} points")
 
         
         expected_number = 1e5
@@ -127,7 +129,7 @@ class Parser:
         # points_rgb = np.random.rand(int(expected_number), 3)
 
         print(
-            f"[Parser] {N} images."
+            f"[Parser] {N} images, {len(points)} points, voxel size {voxel_size}."
         )
 
         w2c_mats = np.stack(w2c_mats, axis=0)
@@ -219,7 +221,8 @@ class Dataset:
     def __getitem__(self, item: int) -> Dict[str, Any]:
         index = self.indices[item]
         image = imageio.imread(self.parser.image_paths[index])[..., :3]
-        depth = imageio.imread(self.parser.depth_paths[index])[..., :3]/1000.0
+        depth = o3d.io.read_image(self.parser.depth_paths[index])
+        depth = np.asarray(depth).astype(np.float32)
         camera_id = self.parser.camera_ids[index]
         K = self.parser.Ks_dict[camera_id].copy()  # undistorted K
         params = self.parser.params_dict[camera_id]

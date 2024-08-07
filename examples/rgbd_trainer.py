@@ -13,7 +13,10 @@ import torch.nn.functional as F
 import tqdm
 import tyro
 import viser
-from datasets.rgbd import Dataset, Parser
+from datasets.rgbd import Dataset as RGBD_Dataset
+from datasets.rgbd import Parser as RGBD_Parser
+from datasets.slam_dataset import Dataset as SLAM_Dataset
+from datasets.slam_dataset import Parser as SLAM_Parser
 from datasets.traj import generate_interpolated_path
 from torch import Tensor
 from torch.utils.tensorboard import SummaryWriter
@@ -156,7 +159,7 @@ class Config:
 
 
 def create_splats_with_optimizers(
-    parser: Parser,
+    parser,
     init_type: str = "sfm",
     init_num_pts: int = 100_000,
     init_extent: float = 3.0,
@@ -247,19 +250,35 @@ class Runner:
         self.writer = SummaryWriter(log_dir=f"{cfg.result_dir}/tb")
 
         # Load data: Training data should contain initial points and colors.
-        self.parser = Parser(
-            data_dir=cfg.data_dir,
-            factor=cfg.data_factor,
-            normalize=False,
-            test_every=cfg.test_every,
-        )
-        self.trainset = Dataset(
-            self.parser,
-            split="train",
-            patch_size=cfg.patch_size,
-            load_depths=cfg.depth_loss,
-        )
-        self.valset = Dataset(self.parser, split="val")
+        if cfg.dataset == "rgbd":
+            self.parser = RGBD_Parser(
+                data_dir=cfg.data_dir,
+                factor=cfg.data_factor,
+                normalize=False,
+                test_every=cfg.test_every,
+            )
+            self.trainset = RGBD_Dataset(
+                self.parser,
+                split="train",
+                patch_size=cfg.patch_size,
+                load_depths=cfg.depth_loss,
+            )
+            self.valset = RGBD_Dataset(self.parser, split="val")
+        else:
+            self.parser = SLAM_Parser(
+                data_dir=cfg.data_dir,
+                dataset_type=cfg.dataset,
+                factor=cfg.data_factor,
+                normalize=False,
+                test_every=cfg.test_every,
+            )
+            self.trainset = SLAM_Dataset(
+                self.parser,
+                split="train",
+                patch_size=cfg.patch_size,
+                load_depths=cfg.depth_loss,
+            )
+            self.valset = SLAM_Dataset(self.parser, split="val")
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
         print("Scene scale:", self.scene_scale)
 
@@ -509,8 +528,8 @@ class Runner:
             if cfg.depth_loss:
                 # calculate loss in disparity space
                 disp = torch.where(depths > 0.0, 1.0 / depths, torch.zeros_like(depths))
-                disp_gt = 1.0 / depths_gt  # [1, M]
-                depthloss = F.l1_loss(disp, disp_gt) * self.scene_scale
+                disp_gt = 1.0 / depths_gt
+                depthloss = F.l1_loss(disp.squeeze(), disp_gt.squeeze()) * self.scene_scale
                 loss += depthloss * cfg.depth_lambda
 
             loss.backward()
@@ -741,8 +760,8 @@ class Runner:
         """Callable function for the viewer."""
         W, H = img_wh
         c2w = camera_state.c2w
+        c2w = (self.trainset[0]['camtoworld'] @ torch.from_numpy(c2w).float()).to(self.device)
         K = camera_state.get_K(img_wh)
-        c2w = torch.from_numpy(c2w).float().to(self.device)
         K = torch.from_numpy(K).float().to(self.device)
 
         render_colors, _, _ = self.rasterize_splats(

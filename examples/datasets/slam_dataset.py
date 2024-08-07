@@ -8,6 +8,8 @@ import torch
 import pathlib
 import open3d as o3d
 from spatialmath.base import q2r
+from spatialmath import SE3, SO3
+from .dataloader import TartanAirLoader, TUMLoader
 import yaml
 
 from .normalize import (
@@ -33,43 +35,31 @@ class Parser:
     def __init__(
         self,
         data_dir: str,
+        dataset_type: str = "tum",
         factor: int = 1,
         normalize: bool = False,
         test_every: int = 8,
     ):
         self.data_dir = data_dir
+        self.dataset_type = dataset_type
         self.factor = factor
         self.normalize = normalize
         self.test_every = test_every
 
         # load dataset
-        data_folder = pathlib.Path(data_dir)
-        rgb_folder = data_folder / 'rgb'
-        depth_folder = data_folder / 'depth'
-        traj_file = data_folder / 'traj.tum'
-        cam_file = data_folder / 'camera.yaml'
-        N = sum(1 for _ in rgb_folder.iterdir()if _.is_file())
-        # N=5
+        if dataset_type=='tartanair':
+            dataset = TartanAirLoader(data_dir)
+        elif dataset_type=='tum':
+            dataset = TUMLoader(data_dir)
 
-
-        # read traj file
-        traj_raw = []
-        with open(traj_file) as f:
-            for line in f:
-                traj_raw.append([float(x) for x in line.strip().split()])
+        self.dataset = dataset
+        total_frames = dataset.get_total_number()
+        dataset.load_ground_truth()
 
         # instrinsic
-        with open(cam_file) as f:
-            cam_data = yaml.load(f, Loader=yaml.FullLoader)
-        fx, fy, cx, cy = cam_data['fx'], cam_data['fy'], cam_data['cx'], cam_data['cy']
-        image_width, image_height = cam_data['image_width'], cam_data['image_height']
+        fx, fy, cx, cy = dataset.camera
+        image_width, image_height = dataset.image_size
         intrinsic = o3d.camera.PinholeCameraIntrinsic(image_width, image_height, fx, fy, cx, cy)
-        conv_mat = np.array([
-            [1, 0, 0, 0],
-            [0, -1, 0, 0],
-            [0, 0, -1, 0],
-            [0, 0, 0, 1],
-        ])
 
         # Extract extrinsic matrices in world-to-camera format.
         w2c_mats = []
@@ -77,57 +67,61 @@ class Parser:
         Ks_dict = dict()
         params_dict = dict()
         imsize_dict = dict() # width, height
-        image_names = []
-        image_paths = []
-        depth_paths = []
         stacked_pc = o3d.geometry.PointCloud()
+
+        conv_T = np.array([
+            [0,0,1,0],
+            [0,1,0,0],
+            [-1,0,0,0],
+            [0,0,0,1]
+        ])
         
-        # for i in range(N):
-        for i in range(0,20):
-            T = np.eye(4)
-            T[:3, :3] = q2r(traj_raw[i][4:8], order='xyzs')
-            T[:3, 3] = traj_raw[i][1:4]
-            w2c_mats.append(T)
+        N=0
+        for i in range(30, total_frames, 3):
+            N+=1
+            dataset.set_curr_index(i)
+            T = dataset.read_current_ground_truth()
+            T = np.array(T)
+            w2c_mats.append(np.linalg.inv(T))
             camera_id = i
             camera_ids.append(camera_id)
-            K = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]])
+            K = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float32)
             K[:2, :] /= factor
             Ks_dict[camera_id] = K
             params = np.empty(0, dtype=np.float32)
             camtype = "perspective"
             params_dict[camera_id] = params
             imsize_dict[camera_id] = (image_width // factor, image_height // factor)
-            image_names.append(f'rgb_{i+1}.png')
             # load pc
-            rgb_file = rgb_folder / f'rgb_{i+1}.png'
-            depth_file = depth_folder / f'depth_{i+1}.png'
-            image_paths.append(str(rgb_file))
-            depth_paths.append(str(depth_file))
-
-            rgb = o3d.io.read_image(str(rgb_file))
-            depth = o3d.io.read_image(str(depth_file))
-            depth = np.asarray(depth).astype(np.float32)
-            depth = o3d.geometry.Image(depth)
-            rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(rgb, depth, convert_rgb_to_intensity=False, depth_trunc=100)
+            rgb, depth = dataset.read_current_rgbd()
+            rgb = o3d.geometry.Image(rgb)
+            depth = o3d.geometry.Image(depth.astype(np.float32))
+            rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(rgb, depth, convert_rgb_to_intensity=False, depth_trunc=100, depth_scale=1)
             pcd = o3d.geometry.PointCloud.create_from_rgbd_image(rgbd, intrinsic)
-            pcd = pcd.voxel_down_sample(voxel_size=0.01)
+            pcd = pcd.voxel_down_sample(voxel_size=0.1)
             pcd.transform(T)
             stacked_pc += pcd
+            print(f"point cloud {i} has {len(pcd.points)} points")
 
+        self.total_number = N
         
-        expected_number = 1e5
-        voxel_size = 0.01
+        expected_number = 100_000
+        voxel_size = 0.1
         while len(stacked_pc.points) > expected_number:
             voxel_size *= 1.1
             stacked_pc = stacked_pc.voxel_down_sample(voxel_size=voxel_size)
         points = np.asarray(stacked_pc.points, dtype=np.float32)
         points_rgb = (np.asarray(stacked_pc.colors)*255).astype(np.uint8)
 
-        # points = np.random.rand(int(expected_number), 3)
-        # points_rgb = np.random.rand(int(expected_number), 3)
+        # T0 = np.linalg.inv(w2c_mats[0])
+        # points = np.random.rand(int(expected_number), 3) * 100
+        # points = np.hstack([points, np.ones((expected_number, 1))])
+        # points = (T0 @ points.T).T
+        # points = points[:, :3]
+        # points_rgb = np.random.rand(int(expected_number), 3)*255
 
         print(
-            f"[Parser] {N} images."
+            f"[Parser] {N} images, {len(points)} points, voxel size {voxel_size}."
         )
 
         w2c_mats = np.stack(w2c_mats, axis=0)
@@ -149,9 +143,6 @@ class Parser:
         else:
             transform = np.eye(4)
 
-        self.image_names = image_names  # List[str], (num_images,)
-        self.image_paths = image_paths  # List[str], (num_images,)
-        self.depth_paths = depth_paths  # List[str], (num_images,)
         self.camtoworlds = camtoworlds  # np.ndarray, (num_images, 4, 4)
         self.camera_ids = camera_ids  # List[int], (num_images,)
         self.Ks_dict = Ks_dict  # Dict of camera_id -> K
@@ -207,7 +198,7 @@ class Dataset:
         self.split = split
         self.patch_size = patch_size
         self.load_depths = load_depths
-        indices = np.arange(len(self.parser.image_names))
+        indices = np.arange(len(parser.camera_ids))
         if split == "train":
             self.indices = indices[indices % self.parser.test_every != 0]
         else:
@@ -217,9 +208,11 @@ class Dataset:
         return len(self.indices)
 
     def __getitem__(self, item: int) -> Dict[str, Any]:
+        dataset = self.parser.dataset
         index = self.indices[item]
-        image = imageio.imread(self.parser.image_paths[index])[..., :3]
-        depth = imageio.imread(self.parser.depth_paths[index])[..., :3]/1000.0
+        dataset.set_curr_index(self.parser.camera_ids[index])
+        image, depth = dataset.read_current_rgbd()
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         camera_id = self.parser.camera_ids[index]
         K = self.parser.Ks_dict[camera_id].copy()  # undistorted K
         params = self.parser.params_dict[camera_id]
@@ -270,6 +263,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_dir", type=str, default="data/360_v2/garden")
+    parser.add_argument("--dataset_type", type=str, default="tum")
     parser.add_argument("--factor", type=int, default=4)
     args = parser.parse_args()
 
