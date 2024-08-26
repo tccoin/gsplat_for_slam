@@ -77,7 +77,7 @@ class Parser:
         ])
         
         N=0
-        for i in range(30, total_frames, 3):
+        for i in range(0, total_frames, 1):
             N+=1
             dataset.set_curr_index(i)
             T = dataset.read_current_ground_truth()
@@ -208,6 +208,91 @@ class Dataset:
         return len(self.indices)
 
     def __getitem__(self, item: int) -> Dict[str, Any]:
+        dataset = self.parser.dataset
+        index = self.indices[item]
+        dataset.set_curr_index(self.parser.camera_ids[index])
+        image, depth = dataset.read_current_rgbd()
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        camera_id = self.parser.camera_ids[index]
+        K = self.parser.Ks_dict[camera_id].copy()  # undistorted K
+        params = self.parser.params_dict[camera_id]
+        camtoworlds = self.parser.camtoworlds[index]
+        factor = self.parser.factor
+
+        if len(params) > 0:
+            # Images are distorted. Undistort them.
+            mapx, mapy = (
+                self.parser.mapx_dict[camera_id],
+                self.parser.mapy_dict[camera_id],
+            )
+            image = cv2.remap(image, mapx, mapy, cv2.INTER_LINEAR)
+            x, y, w, h = self.parser.roi_undist_dict[camera_id]
+            image = image[y : y + h, x : x + w]
+
+        if factor < 1:
+            # Downsample images.
+            image = cv2.resize(image, (0, 0), fx=factor, fy=factor)
+
+        if self.patch_size is not None:
+            # Random crop.
+            h, w = image.shape[:2]
+            x = np.random.randint(0, max(w - self.patch_size, 1))
+            y = np.random.randint(0, max(h - self.patch_size, 1))
+            image = image[y : y + self.patch_size, x : x + self.patch_size]
+            K[0, 2] -= x
+            K[1, 2] -= y
+
+        data = {
+            "K": torch.from_numpy(K).float(),
+            "camtoworld": torch.from_numpy(camtoworlds).float(),
+            "image": torch.from_numpy(image).float(),
+            "image_id": item,  # the index of the image in the dataset
+        }
+
+        if self.load_depths:
+            data["depths"] = torch.from_numpy(depth).float()
+
+        return data
+
+class MultipleDataset:
+    """A dataset class that takes multiple parsers."""
+
+    def __init__(
+        self,
+        parsers: list[Parser],
+        split: str = "train",
+        patch_size: Optional[int] = None,
+        load_depths: bool = False,
+    ):
+        self.parsers = parsers
+        self.split = split
+        self.patch_size = patch_size
+        self.load_depths = load_depths
+
+        seq_counts = []
+        for parser in parsers:
+            seq_counts.append(len(parser.camera_ids))
+        seq_counts = np.array(seq_counts)
+        self.seq_counts = seq_counts
+        self.seq_counts_cumsum = np.cumsum(seq_counts)
+
+        indices = np.arange(np.sum(seq_counts))
+
+        if split == "train":
+            self.indices = indices[indices % self.parser.test_every != 0]
+        else:
+            self.indices = indices[indices % self.parser.test_every == 0]
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, global_id: int) -> Dict[str, Any]:
+        seq_i = np.searchsorted(self.seq_counts_cumsum, global_id, side='right')
+        parser = self.parsers[seq_i]
+        if seq_i == 0:
+            item = global_id
+        elif seq_i>0:
+            item = global_id - self.seq_counts_cumsum[seq_i-1]
         dataset = self.parser.dataset
         index = self.indices[item]
         dataset.set_curr_index(self.parser.camera_ids[index])

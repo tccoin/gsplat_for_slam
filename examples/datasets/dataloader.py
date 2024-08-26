@@ -19,6 +19,7 @@ class DataLoaderBase():
         self.end_index = -1
         self.camera = [0, 0, 0, 0]  # fx, fy, cx, cy
         self.image_size = (0, 0)  # width, height
+        self.depth_scale = 1.0
 
     def read_current_rgbd(self) -> tuple[np.ndarray, np.ndarray]:
         raise NotImplementedError()
@@ -48,6 +49,9 @@ class DataLoaderBase():
         dir_path = self.dataset_folder + self.stereo_folders[0]
         return len([entry for entry in os.listdir(dir_path)
                     if os.path.isfile(os.path.join(dir_path, entry))])
+
+    def __len__(self) -> int:
+        return self.get_total_number()
 
     def _load_traj(self, traj_type, traj_filename, ignore_timestamps=False, add_timestamps=False) -> SE3:
         '''
@@ -157,6 +161,7 @@ class TartanAirLoader(DataLoaderBase):
         self.odom_filename = 'pose_left.txt'
         self.camera = [320, 320, 320, 240]  # fx, fy, cx, cy
         self.image_size = (640, 480)  # width, height
+        self.depth_scale = 1.0
 
     def read_current_rgbd(self) -> tuple[np.ndarray, np.ndarray]:
         index_str = super()._zeros(6, self.curr_index)
@@ -213,6 +218,7 @@ class TUMLoader(DataLoaderBase):
         self.gt_filename = 'groundtruth.txt'
         self.camera = [525.0, 525.0, 319.5, 239.5]  # fx, fy, cx, cy
         self.image_size = (640, 480)  # width, height
+        self.depth_scale = 1.0
         # load file names
         self.rgb_files = []
         for root, dirs, files in os.walk(self.dataset_folder+self.rgb_folder):
@@ -248,8 +254,9 @@ class TUMLoader(DataLoaderBase):
         association = self.associations[self.curr_index]
         rgb = cv2.imread(
             f'{self.dataset_folder}{self.rgb_folder}{association[0]}.png')
+        # rgb = cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB)
         depth = cv2.imread(
-            f'{self.dataset_folder}{self.depth_folder}{association[1]}.png', cv2.IMREAD_ANYDEPTH)/5000
+            f'{self.dataset_folder}{self.depth_folder}{association[1]}.png', cv2.IMREAD_ANYDEPTH)/5000.0
         return (rgb, depth)
 
     def read_current_ground_truth(self) -> SE3:
@@ -257,24 +264,14 @@ class TUMLoader(DataLoaderBase):
 
     def load_ground_truth(self) -> None:
         poses = self._load_traj('tum', self.gt_filename)
-
-        T = np.array([
-            [1, 0, 0, 0],
-            [0, 0, -1, 0],
-            [0, 1, 0, 0],
-            [0, 0, 0, 1]
-        ])
-        T_inv = np.linalg.inv(T)
-
         # associate gt to self.associations
         rgb_timestamp = np.array([float(x[0]) for x in self.associations])
         traj_timestamp = np.array(poses.timestamps)
         time_diff = rgb_timestamp.reshape((-1,1)) - traj_timestamp.reshape((1,-1))
         min_diff_index = np.argmin(np.abs(time_diff), axis=1)
         associations = [(rgb_timestamp[i], traj_timestamp[min_diff_index[i]]) for i in range(len(rgb_timestamp))]
-        print(associations)
+        # print(associations)
         gt = [poses.data[min_diff_index[i]] for i in range(len(rgb_timestamp))]
-        gt = [T@pose@T_inv for pose in gt]
         self.gt = SE3(gt)
 
     def set_ground_truth(self, traj) -> None:

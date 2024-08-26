@@ -61,9 +61,9 @@ class Config:
     # Number of training steps
     max_steps: int = 30_000
     # Steps to evaluate the model
-    eval_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
+    eval_steps: List[int] = field(default_factory=lambda: [3_000, 7_000, 10_000, 20_000, 30_000]) #[7_000, 30_000])
     # Steps to save the model
-    save_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
+    save_steps: List[int] = field(default_factory=lambda: [1_000, 3_000, 7_000, 10_000, 20_000, 30_000])
 
     # Initialization strategy
     init_type: str = "sfm"
@@ -140,7 +140,7 @@ class Config:
     # Enable depth loss. (experimental)
     depth_loss: bool = False
     # Weight for depth loss
-    depth_lambda: float = 5e-2
+    depth_lambda: float = 0.3 #5e-2
 
     # Dump information to tensorboard every this steps
     tb_every: int = 100
@@ -159,7 +159,8 @@ class Config:
 
 
 def create_splats_with_optimizers(
-    parser,
+    points: np.array,
+    points_rgb: np.array,
     init_type: str = "sfm",
     init_num_pts: int = 100_000,
     init_extent: float = 3.0,
@@ -173,8 +174,8 @@ def create_splats_with_optimizers(
     device: str = "cuda",
 ) -> Tuple[torch.nn.ParameterDict, Dict[str, torch.optim.Optimizer]]:
     if init_type == "sfm":
-        points = torch.from_numpy(parser.points).float()
-        rgbs = torch.from_numpy(parser.points_rgb / 255.0).float()
+        points = torch.from_numpy(points).float()
+        rgbs = torch.from_numpy(points_rgb / 255.0).float()
     elif init_type == "random":
         points = init_extent * scene_scale * (torch.rand((init_num_pts, 3)) * 2 - 1)
         rgbs = torch.rand((init_num_pts, 3))
@@ -264,7 +265,7 @@ class Runner:
                 load_depths=cfg.depth_loss,
             )
             self.valset = RGBD_Dataset(self.parser, split="val")
-        else:
+        elif cfg.dataset == "tartanair" or cfg.dataset == "tum":
             self.parser = SLAM_Parser(
                 data_dir=cfg.data_dir,
                 dataset_type=cfg.dataset,
@@ -282,10 +283,15 @@ class Runner:
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
         print("Scene scale:", self.scene_scale)
 
+
+        points = self.parser.points
+        points_rgb = self.parser.points_rgb
+
         # Model
         feature_dim = 32 if cfg.app_opt else None
         self.splats, self.optimizers = create_splats_with_optimizers(
-            self.parser,
+            points=points,
+            points_rgb=points_rgb,
             init_type=cfg.init_type,
             init_num_pts=cfg.init_num_pts,
             init_extent=cfg.init_extent,
@@ -527,9 +533,11 @@ class Runner:
             loss = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda
             if cfg.depth_loss:
                 # calculate loss in disparity space
-                disp = torch.where(depths > 0.0, 1.0 / depths, torch.zeros_like(depths))
-                disp_gt = 1.0 / depths_gt
-                depthloss = F.l1_loss(disp.squeeze(), disp_gt.squeeze()) * self.scene_scale
+                # disp = torch.where(depths > 0.0, 1.0 / depths, torch.zeros_like(depths))
+                # disp_gt = torch.where(depths_gt > 0.0, 1.0 / depths_gt, torch.zeros_like(depths_gt))
+                disp = torch.where(depths > 0.0, depths, torch.zeros_like(depths))
+                disp_gt = torch.where(depths_gt > 0.0, depths_gt, torch.zeros_like(depths_gt))
+                depthloss = F.l1_loss(disp.squeeze(), disp_gt.squeeze())# * self.scene_scale
                 loss += depthloss * cfg.depth_lambda
 
             loss.backward()
@@ -707,8 +715,8 @@ class Runner:
         cfg = self.cfg
         device = self.device
 
-        camtoworlds = self.parser.camtoworlds[5:-5]
-        camtoworlds = generate_interpolated_path(camtoworlds, 1)  # [N, 3, 4]
+        camtoworlds = self.parser.camtoworlds[5:-5, :3]
+        # camtoworlds = generate_interpolated_path(camtoworlds, 1)  # [N, 3, 4]
         camtoworlds = np.concatenate(
             [
                 camtoworlds,
