@@ -25,11 +25,16 @@ from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from utils import AppearanceOptModule, CameraOptModule, knn, rgb_to_sh, set_random_seed
 
 from gsplat.rendering import rasterization
-from gsplat.strategy import DefaultStrategy
+from gsplat.strategy import DefaultStrategy, MCMCStrategy
 
 
 @dataclass
 class Config:
+    # Disable opacity
+    disable_opacity: bool = False
+    # Strategy for updating GSs (default or mcmc)
+    strategy: str = "mcmc"
+
     # Disable viewer
     disable_viewer: bool = False
     # Path to the .pt file. If provide, it will skip training and render a video
@@ -86,6 +91,15 @@ class Config:
     near_plane: float = 0.01
     # Far plane clipping distance
     far_plane: float = 1e10
+
+    # MCMC Maximum number of GSs.
+    cap_max: int = 2_000_000
+    # MCMC samping noise learning rate
+    noise_lr = 5e5
+    # MCMC Opacity regularization
+    opacity_reg = 0.01
+    # MCMC Scale regularization
+    scale_reg = 0.01
 
     # GSs with opacity below this value will be pruned
     prune_opa: float = 0.005
@@ -171,6 +185,7 @@ def create_splats_with_optimizers(
     sparse_grad: bool = False,
     batch_size: int = 1,
     feature_dim: Optional[int] = None,
+    disable_opacity: bool = False,
     device: str = "cuda",
 ) -> Tuple[torch.nn.ParameterDict, Dict[str, torch.optim.Optimizer]]:
     if init_type == "sfm":
@@ -188,15 +203,26 @@ def create_splats_with_optimizers(
     dist_avg = torch.sqrt(dist2_avg)
     scales = torch.log(dist_avg * init_scale).unsqueeze(-1).repeat(1, 3)  # [N, 3]
     quats = torch.rand((N, 4))  # [N, 4]
-    opacities = torch.logit(torch.full((N,), init_opacity))  # [N,]
 
-    params = [
-        # name, value, lr
-        ("means", torch.nn.Parameter(points), 1.6e-4 * scene_scale),
-        ("scales", torch.nn.Parameter(scales), 5e-3),
-        ("quats", torch.nn.Parameter(quats), 1e-3),
-        ("opacities", torch.nn.Parameter(opacities), 5e-2),
-    ]
+    if disable_opacity:
+        # opacities = torch.logit(torch.full((N,), .1))  # [N,]
+        opacities = torch.logit(torch.full((N,), 1))  # [N,]
+        params = [
+            # name, value, lr
+            ("means", torch.nn.Parameter(points), 1.6e-4 * scene_scale),
+            ("scales", torch.nn.Parameter(scales), 5e-3),
+            ("quats", torch.nn.Parameter(quats), 1e-3),
+            ("opacities", torch.nn.Parameter(opacities), 0),
+        ]
+    else:
+        opacities = torch.logit(torch.full((N,), init_opacity))  # [N,]
+        params = [
+            # name, value, lr
+            ("means", torch.nn.Parameter(points), 1.6e-4 * scene_scale),
+            ("scales", torch.nn.Parameter(scales), 5e-3),
+            ("quats", torch.nn.Parameter(quats), 1e-3),
+            ("opacities", torch.nn.Parameter(opacities), 5e-2),
+        ]
 
     if feature_dim is None:
         # color is SH coefficients.
@@ -302,26 +328,40 @@ class Runner:
             sparse_grad=cfg.sparse_grad,
             batch_size=cfg.batch_size,
             feature_dim=feature_dim,
+            disable_opacity=cfg.disable_opacity,
             device=self.device,
         )
         print("Model initialized. Number of GS:", len(self.splats["means"]))
 
         # Densification Strategy
-        self.strategy = DefaultStrategy(
-            verbose=True,
-            scene_scale=self.scene_scale,
-            prune_opa=cfg.prune_opa,
-            grow_grad2d=cfg.grow_grad2d,
-            grow_scale3d=cfg.grow_scale3d,
-            prune_scale3d=cfg.prune_scale3d,
-            # refine_scale2d_stop_iter=4000, # splatfacto behavior
-            refine_start_iter=cfg.refine_start_iter,
-            refine_stop_iter=cfg.refine_stop_iter,
-            reset_every=cfg.reset_every,
-            refine_every=cfg.refine_every,
-            absgrad=cfg.absgrad,
-            revised_opacity=cfg.revised_opacity,
-        )
+        print("Using strategy:", cfg.strategy)
+        if cfg.strategy == "mcmc":
+            self.strategy = MCMCStrategy(
+                verbose=True,
+                cap_max=cfg.cap_max,
+                noise_lr=cfg.noise_lr,
+                refine_start_iter=cfg.refine_start_iter,
+                refine_stop_iter=cfg.refine_stop_iter,
+                refine_every=cfg.refine_every,
+                scene_scale=self.scene_scale,
+                prune_scale3d=cfg.prune_scale3d,
+            )
+        else:
+            self.strategy = DefaultStrategy(
+                verbose=True,
+                scene_scale=self.scene_scale,
+                prune_opa=cfg.prune_opa,
+                grow_grad2d=cfg.grow_grad2d,
+                grow_scale3d=cfg.grow_scale3d,
+                prune_scale3d=cfg.prune_scale3d,
+                # refine_scale2d_stop_iter=4000, # splatfacto behavior
+                refine_start_iter=cfg.refine_start_iter,
+                refine_stop_iter=cfg.refine_stop_iter,
+                reset_every=cfg.reset_every,
+                refine_every=cfg.refine_every,
+                absgrad=cfg.absgrad,
+                revised_opacity=cfg.revised_opacity,
+            )
         self.strategy.check_sanity(self.splats, self.optimizers)
         self.strategy_state = self.strategy.initialize_state()
 
@@ -525,30 +565,42 @@ class Runner:
                 info=info,
             )
 
+            # remove sky
+            depths_gt = depths_gt.unsqueeze(-1)
+            mask = depths_gt < 10000.0
+            depths = torch.where(mask, depths, 0.)
+            depths_gt = torch.where(mask, depths_gt, 0.)
+            mask = mask.expand(*mask.shape[:3], 3)
+            colors = torch.where(mask, colors, 0.)
+            pixels = torch.where(mask, pixels, 0.)
+
             # loss
-            l1loss = F.l1_loss(colors, pixels)
+            l1loss = F.l1_loss(colors, pixels) # color: [1, H, W, 3]
             ssimloss = 1.0 - self.ssim(
                 pixels.permute(0, 3, 1, 2), colors.permute(0, 3, 1, 2)
             )
+            psnr = self.psnr(
+                pixels.permute(0, 3, 1, 2), colors.permute(0, 3, 1, 2)
+            )   
             loss = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda
             if cfg.depth_loss:
                 # calculate loss in disparity space
-                # disp = torch.where(depths > 0.0, 1.0 / depths, torch.zeros_like(depths))
-                # disp_gt = torch.where(depths_gt > 0.0, 1.0 / depths_gt, torch.zeros_like(depths_gt))
-                disp = torch.where(depths > 0.0, depths, torch.zeros_like(depths))
-                disp_gt = torch.where(depths_gt > 0.0, depths_gt, torch.zeros_like(depths_gt))
+                disp = torch.where(depths > 0.0, 1.0 / depths, 0)
+                disp_gt = torch.where(depths_gt > 0.0, 1.0 / depths_gt, 0)
                 depthloss = F.l1_loss(disp.squeeze(), disp_gt.squeeze())# * self.scene_scale
+                # depthloss = F.l1_loss(depths.squeeze(), depths_gt.squeeze())# * self.scene_scale
                 loss += depthloss * cfg.depth_lambda
 
             loss.backward()
 
-            desc = f"loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| "
+            # sh degree={sh_degree_to_use}
+            desc = f"loss={loss.item():.3f} psnr={psnr:.3f} l1={l1loss.item():.3f} ssim={ssimloss.item():.3f}"
             if cfg.depth_loss:
-                desc += f"depth loss={depthloss.item():.6f}| "
+                desc += f" depth loss={depthloss.item():.3f}"
             if cfg.pose_opt and cfg.pose_noise:
                 # monitor the pose error if we inject noise
                 pose_err = F.l1_loss(camtoworlds_gt, camtoworlds)
-                desc += f"pose err={pose_err.item():.6f}| "
+                desc += f" pose err={pose_err.item():.3f}"
             pbar.set_description(desc)
 
             if cfg.tb_every > 0 and step % cfg.tb_every == 0:
@@ -567,13 +619,24 @@ class Runner:
                     self.writer.add_image("train/render_depth", canvas, step)
                 self.writer.flush()
 
-            self.strategy.step_post_backward(
-                params=self.splats,
-                optimizers=self.optimizers,
-                state=self.strategy_state,
-                step=step,
-                info=info,
-            )
+
+            if cfg.strategy == "mcmc":
+                self.strategy.step_post_backward(
+                    params=self.splats,
+                    optimizers=self.optimizers,
+                    state=self.strategy_state,
+                    step=step,
+                    info=info,
+                    lr=schedulers[0].get_last_lr()[0],
+                )
+            else:
+                self.strategy.step_post_backward(
+                    params=self.splats,
+                    optimizers=self.optimizers,
+                    state=self.strategy_state,
+                    step=step,
+                    info=info,
+                )
 
             # Turn Gradients into Sparse Tensor before running optimizer
             if cfg.sparse_grad:

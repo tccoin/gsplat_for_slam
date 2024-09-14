@@ -180,7 +180,7 @@ class DefaultStrategy(Strategy):
             state["count"].zero_()
             torch.cuda.empty_cache()
 
-        if step % self.reset_every == 0:
+        if step % self.reset_every == 0 and step > 0:
             reset_opa(
                 params=params,
                 optimizers=optimizers,
@@ -298,20 +298,20 @@ class DefaultStrategy(Strategy):
         step: int,
     ) -> int:
         is_prune = torch.sigmoid(params["opacities"]) < self.prune_opa
-        if step > self.reset_every:
-            is_too_big = (
-                torch.exp(params["scales"]).max(dim=-1).values
-                > self.prune_scale3d * self.scene_scale
-            )
-            # The official code also implements sreen-size pruning but
-            # it's actually not being used due to a bug:
-            # https://github.com/graphdeco-inria/gaussian-splatting/issues/123
-            # We implement it here for completeness but set `refine_scale2d_stop_iter`
-            # to 0 by default to disable it.
-            if step < self.refine_scale2d_stop_iter:
-                is_too_big |= state["radii"] > self.prune_scale2d
+        # if step > self.reset_every:
+        is_too_big = (
+            torch.exp(params["scales"]).max(dim=-1).values
+            > self.prune_scale3d * self.scene_scale
+        )
+        # The official code also implements sreen-size pruning but
+        # it's actually not being used due to a bug:
+        # https://github.com/graphdeco-inria/gaussian-splatting/issues/123
+        # We implement it here for completeness but set `refine_scale2d_stop_iter`
+        # to 0 by default to disable it.
+        if step < self.refine_scale2d_stop_iter:
+            is_too_big |= state["radii"] > self.prune_scale2d
 
-            is_prune = is_prune | is_too_big
+        is_prune = is_prune | is_too_big
 
         n_prune = is_prune.sum().item()
         if n_prune > 0:

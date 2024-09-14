@@ -77,7 +77,9 @@ class Parser:
         ])
         
         N=0
-        for i in range(0, total_frames, 1):
+        frame_step = total_frames // 300
+        print('frame_step', frame_step)
+        for i in range(0, total_frames, frame_step):
             N+=1
             dataset.set_curr_index(i)
             T = dataset.read_current_ground_truth()
@@ -98,15 +100,15 @@ class Parser:
             depth = o3d.geometry.Image(depth.astype(np.float32))
             rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(rgb, depth, convert_rgb_to_intensity=False, depth_trunc=100, depth_scale=1)
             pcd = o3d.geometry.PointCloud.create_from_rgbd_image(rgbd, intrinsic)
-            pcd = pcd.voxel_down_sample(voxel_size=0.1)
+            pcd = pcd.voxel_down_sample(voxel_size=0.05)
             pcd.transform(T)
             stacked_pc += pcd
             print(f"point cloud {i} has {len(pcd.points)} points")
 
         self.total_number = N
         
-        expected_number = 100_000
-        voxel_size = 0.1
+        expected_number = 300_000
+        voxel_size = 0.02
         while len(stacked_pc.points) > expected_number:
             voxel_size *= 1.1
             stacked_pc = stacked_pc.voxel_down_sample(voxel_size=voxel_size)

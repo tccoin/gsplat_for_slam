@@ -6,7 +6,7 @@ import torch
 from torch import Tensor
 
 from .base import Strategy
-from .ops import inject_noise_to_position, relocate, sample_add
+from .ops import inject_noise_to_position, relocate, sample_add, remove
 
 
 @dataclass
@@ -53,6 +53,8 @@ class MCMCStrategy(Strategy):
     refine_every: int = 100
     min_opacity: float = 0.005
     verbose: bool = False
+    scene_scale: float = 1.0
+    prune_scale3d: float = 0.1
 
     def initialize_state(self) -> Dict[str, Any]:
         """Initialize and return the running state for this strategy."""
@@ -137,6 +139,7 @@ class MCMCStrategy(Strategy):
                     f"Now having {len(params['means'])} GSs."
                 )
 
+            # reset running stats
             torch.cuda.empty_cache()
 
         # add noise to GSs
@@ -153,6 +156,8 @@ class MCMCStrategy(Strategy):
     ) -> int:
         opacities = torch.sigmoid(params["opacities"])
         dead_mask = opacities <= self.min_opacity
+        dead_mask = dead_mask | (torch.exp(params["scales"]).max(dim=-1).values
+            > self.prune_scale3d * self.scene_scale)
         n_gs = dead_mask.sum().item()
         if n_gs > 0:
             relocate(
