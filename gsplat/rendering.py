@@ -306,7 +306,6 @@ def rasterization(
 
     if compensations is not None:
         opacities = opacities * compensations
-
     meta.update(
         {
             # global camera_ids
@@ -322,6 +321,7 @@ def rasterization(
     )
 
     # Turn colors into [C, N, D] or [nnz, D] to pass into rasterize_to_pixels()
+
     if sh_degree is None:
         # Colors are post-activation values, with shape [N, D] or [C, N, D]
         if packed:
@@ -360,9 +360,21 @@ def rasterization(
             else:
                 # colors is already [C, N, K, 3]
                 shs = colors
+            # first = masks.nonzero(as_tuple=True)[1][1]
+            # print('camtoworlds:', camtoworlds)
+            # print('N:', shs.shape[1])
+            # print('masks sum:', masks.sum())
+            # print('masks first nonzero:', first)
+            # print('shs:', shs[0,first])
+            # print('dirs:', dirs[0,first])
+            # print('sh_degree:', sh_degree)
             colors = spherical_harmonics(sh_degree, dirs, shs, masks=masks)  # [C, N, 3]
+            # print('colors.shape:', colors.shape)
+            # print('colors:', colors[0, first])
         # make it apple-to-apple with Inria's CUDA Backend.
         colors = torch.clamp_min(colors + 0.5, 0.0)
+        # print('colors_clamp:', colors[0, first])
+        # print('black indice:', (colors[masks]==0).nonzero().shape)
 
     # If in distributed mode, we need to scatter the GSs to the destination ranks, based
     # on which cameras they are visible to, which we already figured out in the projection
